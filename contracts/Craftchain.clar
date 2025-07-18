@@ -8,11 +8,18 @@
 (define-constant ERR-CANNOT-RATE-OWN-PRODUCT (err u106))
 (define-constant ERR-INVALID-RATING (err u107))
 (define-constant ERR-PRODUCT-NOT-PURCHASED (err u108))
+(define-constant ERR-SKILL-ALREADY-CERTIFIED (err u109))
+(define-constant ERR-SKILL-NOT-CERTIFIED (err u110))
+(define-constant ERR-ALREADY-ENDORSED (err u111))
+(define-constant ERR-CANNOT-ENDORSE-SELF (err u112))
+(define-constant ERR-ENDORSER-NOT-VERIFIED (err u113))
+(define-constant ERR-INVALID-SKILL-LEVEL (err u114))
 
 (define-data-var next-artisan-id uint u1)
 (define-data-var next-product-id uint u1)
 (define-data-var next-order-id uint u1)
 (define-data-var platform-fee-percentage uint u250)
+(define-data-var next-certification-id uint u1)
 
 (define-map artisans
   uint
@@ -74,6 +81,37 @@
   bool
 )
 
+(define-map skill-certifications
+  uint
+  {
+    artisan-id: uint,
+    skill-name: (string-ascii 50),
+    level: uint,
+    certified-by: principal,
+    certification-date: uint,
+    expiry-date: uint,
+    is-active: bool
+  }
+)
+
+(define-map artisan-skills
+  {artisan-id: uint, skill-name: (string-ascii 50)}
+  uint
+)
+
+(define-map skill-endorsements
+  {certification-id: uint, endorser-id: uint}
+  {
+    endorsement-message: (string-ascii 200),
+    endorsement-date: uint
+  }
+)
+
+(define-map certification-endorsement-count
+  uint
+  uint
+)
+
 (define-read-only (get-artisan (artisan-id uint))
   (map-get? artisans artisan-id)
 )
@@ -121,6 +159,25 @@
 
 (define-read-only (get-platform-fee-percentage)
   (var-get platform-fee-percentage)
+)
+
+(define-read-only (get-skill-certification (certification-id uint))
+  (map-get? skill-certifications certification-id)
+)
+
+(define-read-only (get-artisan-skill-certification (artisan-id uint) (skill-name (string-ascii 50)))
+  (match (map-get? artisan-skills {artisan-id: artisan-id, skill-name: skill-name})
+    certification-id (get-skill-certification certification-id)
+    none
+  )
+)
+
+(define-read-only (get-skill-endorsement (certification-id uint) (endorser-id uint))
+  (map-get? skill-endorsements {certification-id: certification-id, endorser-id: endorser-id})
+)
+
+(define-read-only (get-certification-endorsement-count (certification-id uint))
+  (default-to u0 (map-get? certification-endorsement-count certification-id))
 )
 
 (define-public (register-artisan (name (string-ascii 100)) (specialty (string-ascii 50)) (location (string-ascii 100)))
@@ -328,6 +385,121 @@
     (map-set products product-id 
       (merge product {is-active: (not (get is-active product))})
     )
+    (ok true)
+  )
+)
+
+(define-public (create-skill-certification 
+  (artisan-id uint) 
+  (skill-name (string-ascii 50)) 
+  (level uint) 
+  (validity-years uint))
+  (let
+    (
+      (artisan (unwrap! (get-artisan artisan-id) ERR-NOT-FOUND))
+      (certification-id (var-get next-certification-id))
+      (current-block stacks-block-height)
+      (blocks-per-year u52560)
+      (expiry-block (+ current-block (* validity-years blocks-per-year)))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (and (>= level u1) (<= level u5)) ERR-INVALID-SKILL-LEVEL)
+    (asserts! (> validity-years u0) ERR-INVALID-AMOUNT)
+    (asserts! (is-none (map-get? artisan-skills {artisan-id: artisan-id, skill-name: skill-name})) ERR-SKILL-ALREADY-CERTIFIED)
+    
+    (map-set skill-certifications certification-id
+      {
+        artisan-id: artisan-id,
+        skill-name: skill-name,
+        level: level,
+        certified-by: tx-sender,
+        certification-date: current-block,
+        expiry-date: expiry-block,
+        is-active: true
+      }
+    )
+    
+    (map-set artisan-skills {artisan-id: artisan-id, skill-name: skill-name} certification-id)
+    (map-set certification-endorsement-count certification-id u0)
+    (var-set next-certification-id (+ certification-id u1))
+    (ok certification-id)
+  )
+)
+
+(define-public (renew-skill-certification (certification-id uint) (validity-years uint))
+  (let
+    (
+      (certification (unwrap! (get-skill-certification certification-id) ERR-NOT-FOUND))
+      (current-block stacks-block-height)
+      (blocks-per-year u52560)
+      (new-expiry-block (+ current-block (* validity-years blocks-per-year)))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (> validity-years u0) ERR-INVALID-AMOUNT)
+    
+    (map-set skill-certifications certification-id
+      (merge certification {
+        expiry-date: new-expiry-block,
+        is-active: true
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-skill-certification (certification-id uint))
+  (let
+    (
+      (certification (unwrap! (get-skill-certification certification-id) ERR-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    
+    (map-set skill-certifications certification-id
+      (merge certification {is-active: false})
+    )
+    (ok true)
+  )
+)
+
+(define-public (endorse-skill-certification 
+  (certification-id uint) 
+  (endorsement-message (string-ascii 200)))
+  (let
+    (
+      (certification (unwrap! (get-skill-certification certification-id) ERR-NOT-FOUND))
+      (endorser-artisan-id (unwrap! (map-get? artisan-wallets tx-sender) ERR-NOT-AUTHORIZED))
+      (endorser (unwrap! (get-artisan endorser-artisan-id) ERR-NOT-FOUND))
+      (current-block stacks-block-height)
+      (current-endorsement-count (get-certification-endorsement-count certification-id))
+    )
+    (asserts! (get verification-status endorser) ERR-ENDORSER-NOT-VERIFIED)
+    (asserts! (get is-active certification) ERR-SKILL-NOT-CERTIFIED)
+    (asserts! (> (get expiry-date certification) current-block) ERR-SKILL-NOT-CERTIFIED)
+    (asserts! (not (is-eq (get artisan-id certification) endorser-artisan-id)) ERR-CANNOT-ENDORSE-SELF)
+    (asserts! (is-none (get-skill-endorsement certification-id endorser-artisan-id)) ERR-ALREADY-ENDORSED)
+    
+    (map-set skill-endorsements {certification-id: certification-id, endorser-id: endorser-artisan-id}
+      {
+        endorsement-message: endorsement-message,
+        endorsement-date: current-block
+      }
+    )
+    
+    (map-set certification-endorsement-count certification-id (+ current-endorsement-count u1))
+    (ok true)
+  )
+)
+
+(define-public (remove-skill-endorsement (certification-id uint))
+  (let
+    (
+      (certification (unwrap! (get-skill-certification certification-id) ERR-NOT-FOUND))
+      (endorser-artisan-id (unwrap! (map-get? artisan-wallets tx-sender) ERR-NOT-AUTHORIZED))
+      (endorsement (unwrap! (get-skill-endorsement certification-id endorser-artisan-id) ERR-NOT-FOUND))
+      (current-endorsement-count (get-certification-endorsement-count certification-id))
+    )
+    (map-delete skill-endorsements {certification-id: certification-id, endorser-id: endorser-artisan-id})
+    (map-set certification-endorsement-count certification-id (- current-endorsement-count u1))
     (ok true)
   )
 )
