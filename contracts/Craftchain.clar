@@ -14,12 +14,21 @@
 (define-constant ERR-CANNOT-ENDORSE-SELF (err u112))
 (define-constant ERR-ENDORSER-NOT-VERIFIED (err u113))
 (define-constant ERR-INVALID-SKILL-LEVEL (err u114))
+(define-constant ERR-AUCTION-NOT-FOUND (err u115))
+(define-constant ERR-AUCTION-NOT-ACTIVE (err u116))
+(define-constant ERR-AUCTION-ENDED (err u117))
+(define-constant ERR-BID-TOO-LOW (err u118))
+(define-constant ERR-AUCTION-NOT-ENDED (err u119))
+(define-constant ERR-AUCTION-ALREADY-FINALIZED (err u120))
+(define-constant ERR-NOT-HIGHEST-BIDDER (err u121))
+(define-constant ERR-INVALID-DURATION (err u122))
 
 (define-data-var next-artisan-id uint u1)
 (define-data-var next-product-id uint u1)
 (define-data-var next-order-id uint u1)
 (define-data-var platform-fee-percentage uint u250)
 (define-data-var next-certification-id uint u1)
+(define-data-var next-auction-id uint u1)
 
 (define-map artisans
   uint
@@ -112,6 +121,47 @@
   uint
 )
 
+(define-map auctions
+  uint
+  {
+    artisan-id: uint,
+    product-id: uint,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    starting-price: uint,
+    current-bid: uint,
+    highest-bidder: (optional principal),
+    start-block: uint,
+    end-block: uint,
+    is-active: bool,
+    is-finalized: bool,
+    reserve-price: uint,
+    bid-increment: uint
+  }
+)
+
+(define-map auction-bids
+  {auction-id: uint, bidder: principal}
+  {
+    bid-amount: uint,
+    bid-block: uint
+  }
+)
+
+(define-map auction-bid-history
+  {auction-id: uint, bid-index: uint}
+  {
+    bidder: principal,
+    bid-amount: uint,
+    bid-block: uint
+  }
+)
+
+(define-map auction-bid-count
+  uint
+  uint
+)
+
 (define-read-only (get-artisan (artisan-id uint))
   (map-get? artisans artisan-id)
 )
@@ -178,6 +228,38 @@
 
 (define-read-only (get-certification-endorsement-count (certification-id uint))
   (default-to u0 (map-get? certification-endorsement-count certification-id))
+)
+
+(define-read-only (get-auction (auction-id uint))
+  (map-get? auctions auction-id)
+)
+
+(define-read-only (get-auction-bid (auction-id uint) (bidder principal))
+  (map-get? auction-bids {auction-id: auction-id, bidder: bidder})
+)
+
+(define-read-only (get-auction-bid-history (auction-id uint) (bid-index uint))
+  (map-get? auction-bid-history {auction-id: auction-id, bid-index: bid-index})
+)
+
+(define-read-only (get-auction-bid-count (auction-id uint))
+  (default-to u0 (map-get? auction-bid-count auction-id))
+)
+
+(define-read-only (is-auction-ended (auction-id uint))
+  (match (get-auction auction-id)
+    auction (>= stacks-block-height (get end-block auction))
+    false
+  )
+)
+
+(define-read-only (get-auction-time-remaining (auction-id uint))
+  (match (get-auction auction-id)
+    auction (if (< stacks-block-height (get end-block auction))
+              (- (get end-block auction) stacks-block-height)
+              u0)
+    u0
+  )
 )
 
 (define-public (register-artisan (name (string-ascii 100)) (specialty (string-ascii 50)) (location (string-ascii 100)))
@@ -503,3 +585,187 @@
     (ok true)
   )
 )
+
+(define-public (create-auction 
+  (product-id uint) 
+  (title (string-ascii 100)) 
+  (description (string-ascii 500)) 
+  (starting-price uint) 
+  (reserve-price uint) 
+  (bid-increment uint) 
+  (duration-blocks uint))
+  (let
+    (
+      (artisan-id (unwrap! (map-get? artisan-wallets tx-sender) ERR-NOT-AUTHORIZED))
+      (product (unwrap! (get-product product-id) ERR-NOT-FOUND))
+      (auction-id (var-get next-auction-id))
+      (current-block stacks-block-height)
+      (end-block (+ current-block duration-blocks))
+    )
+    (asserts! (is-eq (get artisan-id product) artisan-id) ERR-NOT-AUTHORIZED)
+    (asserts! (> starting-price u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= reserve-price starting-price) ERR-INVALID-AMOUNT)
+    (asserts! (> bid-increment u0) ERR-INVALID-AMOUNT)
+    (asserts! (> duration-blocks u0) ERR-INVALID-DURATION)
+    (asserts! (get is-active product) ERR-NOT-FOUND)
+    (asserts! (> (get quantity product) u0) ERR-INSUFFICIENT-FUNDS)
+    
+    (map-set auctions auction-id
+      {
+        artisan-id: artisan-id,
+        product-id: product-id,
+        title: title,
+        description: description,
+        starting-price: starting-price,
+        current-bid: u0,
+        highest-bidder: none,
+        start-block: current-block,
+        end-block: end-block,
+        is-active: true,
+        is-finalized: false,
+        reserve-price: reserve-price,
+        bid-increment: bid-increment
+      }
+    )
+    
+    (map-set auction-bid-count auction-id u0)
+    (var-set next-auction-id (+ auction-id u1))
+    (ok auction-id)
+  )
+)
+
+(define-public (place-bid (auction-id uint) (bid-amount uint))
+  (let
+    (
+      (auction (unwrap! (get-auction auction-id) ERR-AUCTION-NOT-FOUND))
+      (current-block stacks-block-height)
+      (min-bid (if (> (get current-bid auction) u0)
+                  (+ (get current-bid auction) (get bid-increment auction))
+                  (get starting-price auction)))
+      (current-bid-count (get-auction-bid-count auction-id))
+      (existing-bid (get-auction-bid auction-id tx-sender))
+    )
+    (asserts! (get is-active auction) ERR-AUCTION-NOT-ACTIVE)
+    (asserts! (< current-block (get end-block auction)) ERR-AUCTION-ENDED)
+    (asserts! (>= bid-amount min-bid) ERR-BID-TOO-LOW)
+    
+    (match existing-bid
+      previous-bid (try! (as-contract (stx-transfer? (get bid-amount previous-bid) tx-sender tx-sender)))
+      true
+    )
+    
+    (try! (stx-transfer? bid-amount tx-sender (as-contract tx-sender)))
+    
+    (match (get highest-bidder auction)
+      previous-highest (try! (as-contract (stx-transfer? (get current-bid auction) tx-sender previous-highest)))
+      true
+    )
+    
+    (map-set auction-bids {auction-id: auction-id, bidder: tx-sender}
+      {
+        bid-amount: bid-amount,
+        bid-block: current-block
+      }
+    )
+    
+    (map-set auction-bid-history {auction-id: auction-id, bid-index: current-bid-count}
+      {
+        bidder: tx-sender,
+        bid-amount: bid-amount,
+        bid-block: current-block
+      }
+    )
+    
+    (map-set auctions auction-id
+      (merge auction {
+        current-bid: bid-amount,
+        highest-bidder: (some tx-sender)
+      })
+    )
+    
+    (map-set auction-bid-count auction-id (+ current-bid-count u1))
+    (ok true)
+  )
+)
+
+(define-public (finalize-auction (auction-id uint))
+  (let
+    (
+      (auction (unwrap! (get-auction auction-id) ERR-AUCTION-NOT-FOUND))
+      (product (unwrap! (get-product (get product-id auction)) ERR-NOT-FOUND))
+      (artisan (unwrap! (get-artisan (get artisan-id auction)) ERR-NOT-FOUND))
+      (current-block stacks-block-height)
+      (platform-fee (/ (* (get current-bid auction) (var-get platform-fee-percentage)) u10000))
+      (artisan-payment (- (get current-bid auction) platform-fee))
+    )
+    (asserts! (>= current-block (get end-block auction)) ERR-AUCTION-NOT-ENDED)
+    (asserts! (not (get is-finalized auction)) ERR-AUCTION-ALREADY-FINALIZED)
+    
+    (map-set auctions auction-id
+      (merge auction {is-active: false, is-finalized: true})
+    )
+    
+    (match (get highest-bidder auction)
+      winner (begin
+        (asserts! (>= (get current-bid auction) (get reserve-price auction)) (err u999))
+        (try! (as-contract (stx-transfer? artisan-payment tx-sender (get wallet artisan))))
+        
+        (map-set products (get product-id auction)
+          (merge product {
+            quantity: (- (get quantity product) u1),
+            total-sold: (+ (get total-sold product) u1)
+          })
+        )
+        
+        (map-set artisans (get artisan-id auction)
+          (merge artisan {total-sales: (+ (get total-sales artisan) u1)})
+        )
+        
+        (map-set purchased-products {buyer: winner, product-id: (get product-id auction)} true)
+      )
+      (begin
+        (try! (as-contract (stx-transfer? (get current-bid auction) tx-sender (get wallet artisan))))
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-auction (auction-id uint))
+  (let
+    (
+      (auction (unwrap! (get-auction auction-id) ERR-AUCTION-NOT-FOUND))
+      (artisan-id (unwrap! (map-get? artisan-wallets tx-sender) ERR-NOT-AUTHORIZED))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get artisan-id auction) artisan-id) ERR-NOT-AUTHORIZED)
+    (asserts! (get is-active auction) ERR-AUCTION-NOT-ACTIVE)
+    (asserts! (is-eq (get current-bid auction) u0) (err u999))
+    
+    (map-set auctions auction-id
+      (merge auction {is-active: false, is-finalized: true})
+    )
+    (ok true)
+  )
+)
+
+(define-public (extend-auction (auction-id uint) (additional-blocks uint))
+  (let
+    (
+      (auction (unwrap! (get-auction auction-id) ERR-AUCTION-NOT-FOUND))
+      (artisan-id (unwrap! (map-get? artisan-wallets tx-sender) ERR-NOT-AUTHORIZED))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get artisan-id auction) artisan-id) ERR-NOT-AUTHORIZED)
+    (asserts! (get is-active auction) ERR-AUCTION-NOT-ACTIVE)
+    (asserts! (< current-block (get end-block auction)) ERR-AUCTION-ENDED)
+    (asserts! (> additional-blocks u0) ERR-INVALID-DURATION)
+    
+    (map-set auctions auction-id
+      (merge auction {end-block: (+ (get end-block auction) additional-blocks)})
+    )
+    (ok true)
+  )
+)
+
+
